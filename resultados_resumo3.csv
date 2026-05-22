@@ -1,0 +1,2 @@
+gamma,n_final,lambda,mu,rho,media_X_n,wq_teorico,desvio_padrao,ic_inferior,ic_superior,H,H_sobre_X,teorico_no_ic,duracao_wall_s
+0.05,1750,9,10,0.9,0.46077307,0.9,0.48893848,0.43786486,0.48368129,0.02290822,0.049717,False,0.002
