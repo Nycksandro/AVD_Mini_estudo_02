@@ -1,0 +1,2 @@
+n_iteracao,n_alvo,n_amostrado,lambda,mu,rho,media_estimada,wq_teorico,vies,desvio_padrao,ic_inferior,ic_superior,teorico_no_ic,duracao_wall_s
+1,5000,2500000,9.5,10.0,0.95,1.71824185,1.9,-0.18175815,1.53296387,1.67575026,1.76073344,False,2.339
