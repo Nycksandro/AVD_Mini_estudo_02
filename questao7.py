@@ -1,29 +1,24 @@
-import csv
 import math
 import random
 import time
 import os
 from collections import deque
+import scipy.stats as stats
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
-# ─── Configurações Gerais ─────────────────────────────────────────────────────
-GAMMA          = 0.05  # Precisão relativa de 5%
-MSER_K         = 5     # Agrupamento para a curva MSER
-B_LOTES        = 20    # Número fixo de lotes para o NBM
-T_CRITICO_T    = 2.093  # t_0.025 para 19 graus de liberdade (B=20)
-
-MSER_BLOCO_INI = 500_000   # Reduzido ligeiramente para agilizar cenários leves
-MSER_BLOCO_EXT = 200_000
-
-IC_FIRST_CHECK = 2_000     # Amostras mínimas pós-transiente para começar a testar NBM
-IC_RECALC      = 500
+# ─── Parâmetros Gerais ──────────────────────────────────────
+GAMMA        = 0.05   
+B_NBM        = 20   
+BETA_CRITICO = 1.44   
+CONFIDANCA   = 0.95
+MSER_K         = 5    
+MSER_BLOCO_INI = 200_000
+MSER_BLOCO_EXT = 100_000
 
 DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else "."
-PNG_SAIDA   = os.path.join(DIR, "grafico_nbm_cenarios.png")
 
 # ─── Simulador M/M/1 ──────────────────────────────────────────────────────────
 class SimuladorMM1:
@@ -62,7 +57,7 @@ class SimuladorMM1:
                     self.busy     = False
                     self.next_dep = float("inf")
 
-# ─── MSER-5Y Algoritmo de Suporte ─────────────────────────────────────────────
+# ─── MSER-5Y ─────────────────────────────────────────────────────
 def _mser_sufixo(batches, d_ini, d_fim):
     M = len(batches)
     sum_x  = [0.0] * (M + 1)
@@ -79,13 +74,12 @@ def _mser_sufixo(batches, d_ini, d_fim):
     return result
 
 def mser5_warmup(sim, k=MSER_K):
-    tentativa = 0
     while True:
-        samples    = sim.samples
-        n          = len(samples)
-        m          = n // k
-        metade     = m // 2
-        cinco_pct  = max(1, m // 20)
+        samples = sim.samples
+        n = len(samples)
+        m = n // k
+        metade = m // 2
+        cinco_pct = max(1, m // 20)
         fim_janela = metade + cinco_pct
 
         if m < 20:
@@ -101,63 +95,124 @@ def mser5_warmup(sim, k=MSER_K):
         min_mser2 = min((mser for mser, d in mser2_janela), default=float("inf"))
 
         if len(melhores) > 1 or min_mser2 < best_mser:
-            tentativa += 1
             sim.gerar(MSER_BLOCO_EXT)
             continue
 
-        best_d = melhores[0]
-        return best_d * k
+        return melhores[0] * k
 
-# ─── Regra de Parada com NBM (Nonoverlapping Batch Means) ────────────────────
-def estimar_com_nbm_stop(sim, d):
-    """
-    Consome dados pós-transiente d. A cada incremento, recalcula os lotes do NBM
-    usando B fixo (20) e testa a precisão contra GAMMA baseado na variância do lote.
-    """
-    n_pos = IC_FIRST_CHECK
+# ─── Estatística de Rank von Neumann ────────────────────────────────
+def teste_rank_von_neumann(medias_blocos):
+    B = len(medias_blocos)
+    R = [0] * B
+    for i in range(B):
+        R[i] = sum(1 for x in medias_blocos if x <= medias_blocos[i]) 
+        
+    R_barra = sum(R) / B # Média dos postos 
     
-    while True:
-        # Garante que temos amostras suficientes na simulação
-        total_necessario = d + n_pos
-        if total_necessario > len(sim.samples):
-            sim.gerar(total_necessario - len(sim.samples) + IC_RECALC)
+    num = sum((R[j] - R[j+1])**2 for j in range(B - 1))
+    den = sum((R[j] - R_barra)**2 for j in range(B))
+    
+    if den == 0:
+        return float('inf')
+    return num / den
 
-        dados_estacionarios = sim.samples[d:d + n_pos]
+# ─── IMPLEMENTAÇÃO DO NBM────────────────────
+def executar_nbm_estrito(sim, d):
+    M = 100 # tamanho inicial do lote
+    while True:
+        N_necessario = d + (B_NBM * M)
+        if len(sim.samples) < N_necessario:
+            sim.gerar(N_necessario - len(sim.samples))
+            
+        dados_estacionarios = sim.samples[d:d + (B_NBM * M)]
+        medias_blocos = [sum(dados_estacionarios[i*M:(i+1)*M])/M for i in range(B_NBM)]
         
-        # Tamanho de cada um dos B lotes
-        m = n_pos // B_LOTES
+        rvn = teste_rank_von_neumann(medias_blocos)
         
-        # Calcula a média de cada lote do NBM
-        medias_lotes = []
-        for b in range(B_LOTES):
-            inicio_lote = b * m
-            fim_lote = (b + 1) * m
-            medias_lotes.append(sum(dados_estacionarios[inicio_lote:fim_lote]) / m)
+        # Se RVN > Beta, ainda há correlação significativa
+        if rvn > BETA_CRITICO:
+            M = int(M * 1.2) + 1 # Incrementa M de forma geométrica para evitar loops infinitos
+            continue
+            
+        # Fase de Estimação NBM Clássica
+        media_global = sum(medias_blocos) / B_NBM
+        variancia_blocos = sum((x - media_global)**2 for x in medias_blocos) / (B_NBM - 1)
+        erro_padrao = math.sqrt(variancia_blocos / B_NBM)
         
-        # Média global e Variância das médias dos lotes
-        media_global = sum(medias_lotes) / B_LOTES
-        var_lotes = sum((x - media_global) ** 2 for x in medias_lotes) / (B_LOTES - 1)
+        # IC t-Student clássico com B-1 graus de liberdade
+        t_valor = stats.t.ppf(1 - (1 - CONFIDANCA)/2, df=B_NBM - 1)
+        H = t_valor * erro_padrao
         
-        # Erro padrão da média global via NBM
-        erro_padrao = math.sqrt(var_lotes / B_LOTES)
-        
-        # Semáforo de Precisão (Intervalo de Confiança t-Student)
-        H = T_CRITICO_T * erro_padrao
         precisao_relativa = H / media_global if media_global > 0 else float("inf")
         
-        if precisao_relativa <= GAMMA:
+        # Critério de parada de precisão de 5% 
+        if precisao_relativa <= GAMMA or (B_NBM * M) > 12_000_000:
             return {
-                "mean": media_global,
-                "ic_lo": media_global - H,
-                "ic_hi": media_global + H,
-                "n_final": d + n_pos,
-                "d": d
+                "mean": media_global, "ic_lo": media_global - H, "ic_hi": media_global + H,
+                "n_final": d + (B_NBM * M), "d": d, "m": M, "B": B_NBM
             }
         
-        # Caso contrário, avança a janela de teste
-        n_pos += IC_RECALC
+        M = int(M * 1.1) + 1
 
-# ─── Execução dos Cenários ────────────────────────────────────────────────────
+# ─── IMPLEMENTAÇÃO DO OBM ────────────────────
+def executar_obm_estrito(sim, d, pct_overlap):
+    M = 1000  # Tamanho de lote base. O OBM cresce M para varrer a correlação assintoticamente
+    while True:
+        # Define o salto geométrico de avanço conforme o grau de overlap
+        if pct_overlap == 1.0:
+            c = 1
+        elif pct_overlap == 0.50:
+            c = max(1, M // 2)
+        else:
+            c = max(1, int(M * 0.75))
+            
+        Y = len(sim.samples) - d
+        if Y < M * 50: # Garante dados suficientes para computar lotes sobrepostos significativos
+            sim.gerar(M * 50)
+            Y = len(sim.samples) - d
+            
+        dados = sim.samples[d:]
+        
+        # Otimização por somas acumuladas (Prefix Sums) para garantir velocidade em O(N)
+        pref_sum = [0.0] * (Y + 1)
+        for i in range(Y):
+            pref_sum[i+1] = pref_sum[i] + dados[i]
+            
+        medias_obm = []
+        inicio = 0
+        while inicio + M <= Y:
+            soma_lote = pref_sum[inicio + M] - pref_sum[inicio]
+            medias_obm.append(soma_lote / M)
+            inicio += c
+            
+        B_linha = len(medias_obm) # Número total de lotes sobrepostos gerados (B')
+        if B_linha < 10:
+            M = int(M * 1.1) + 1
+            continue
+            
+        media_global = sum(medias_obm) / B_linha
+        variancia_lotes = sum((x - media_global)**2 for x in medias_obm) / (B_linha - 1)
+        
+        # EQUAÇÃO EXATA DO SLIDE DE OBM: H baseado em 1.5 * n - 1 graus de liberdade aproximados
+        gl_ajustado = max(2, int((2 * B_linha) / 3)) 
+        t_valor = stats.t.ppf(1 - (1 - CONFIDANCA)/2, df=gl_ajustado)
+        
+        # Termo sob a raiz explícito H = t * sqrt( (1.5 * M * s^2) / B' )
+        termo_raiz = (1.5 * M * variancia_lotes) / B_linha
+        H = t_valor * math.sqrt(max(0.0, termo_raiz))
+        
+        precisao_relativa = H / media_global if media_global > 0 else float("inf")
+        
+        if precisao_relativa <= GAMMA or Y > 12_000_000:
+            return {
+                "mean": media_global, "ic_lo": media_global - H, "ic_hi": media_global + H,
+                "n_final": d + Y, "d": d, "m": M, "B_linha": B_linha
+            }
+            
+        M = int(M * 1.1) + 1
+        sim.gerar(M * 5)
+
+# ─── Execução e Validação dos Cenários ────────────────────────────────────────
 cenarios = [
     {"id": "I",   "lambda": 7.0,  "mu": 10.0},
     {"id": "II",  "lambda": 8.0,  "mu": 10.0},
@@ -165,11 +220,9 @@ cenarios = [
     {"id": "IV",  "lambda": 9.5,  "mu": 10.0}
 ]
 
-resultados = []
-
-print("=" * 70)
-print(f" Executando Simulação M/M/1 com Remoção MSER-5Y e Parada NBM (B={B_LOTES})")
-print("=" * 70)
+print("=" * 80)
+print(" Execução")
+print("=" * 80)
 
 for ceno in cenarios:
     lam = ceno["lambda"]
@@ -177,63 +230,21 @@ for ceno in cenarios:
     rho = lam / mu
     wq_teorico = (rho / mu) / (1 - rho)
     
-    print(f"\nRodando Cenário {ceno['id']} (λ={lam}, μ={mu}, ρ={rho:.2f})...")
+    print(f"\n▶ Cenário {ceno['id']} (λ={lam}, μ={mu}, ρ={rho:.2f})")
     
-    sim = SimuladorMM1(lam, mu)
-    sim.gerar(MSER_BLOCO_INI)
+    sim_base = SimuladorMM1(lam, mu)
+    sim_base.gerar(MSER_BLOCO_INI)
+    d_est = mser5_warmup(sim_base)
+    print(f"   [Warmup MSER-5Y]: Transiente d* = {d_est:,}")
     
-    # 1. Eliminar transiente via MSER-5Y
-    d_est = mser5_warmup(sim)
+    # Teste e Estimação via NBM Puro
+    t0 = time.time()
+    res_nbm = executar_nbm_estrito(sim_base, d_est)
+    print(f"   [NBM Puro] Concluído em {time.time()-t0:.2f}s | N={res_nbm['n_final']:,} | M={res_nbm['m']:,} | Wq={res_nbm['mean']:.4f}")
     
-    # 2. Processar parada e estatísticas via NBM
-    res = estimar_com_nbm_stop(sim, d_est)
-    res["teorico"] = wq_teorico
-    res["id"] = ceno["id"]
-    res["rho"] = rho
-    
-    cobertura = "✓" if res["ic_lo"] <= wq_teorico <= res["ic_hi"] else "✗"
-    print(f"  -> Concluído: d*={res['d']:,} | N_final={res['n_final']:,}")
-    print(f"  -> Estimado: {res['mean']:.5f} s | Teórico: {wq_teorico:.5f} s [{cobertura}]")
-    
-    resultados.append(res)
+    # Estimação via OBM Puro (Exemplo com Overlap de 100%)
+    t0 = time.time()
+    res_obm = executar_obm_estrito(sim_base, d_est, 1.0)
+    print(f"   [OBM 100%] Concluído em {time.time()-t0:.2f}s | N={res_obm['n_final']:,} | M={res_obm['m']:,} | Wq={res_obm['mean']:.4f}")
 
-# ─── Plotagem dos Gráficos Comparativos ────────────────────────────────────────
-print("\n[Plotando] Gerando gráfico comparativo...")
-
-fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-axes = axes.flatten()
-
-colors = ["#185FA5", "#0F6E56", "#D85A30", "#A32A2A"]
-
-for i, res in enumerate(resultados):
-    ax = axes[i]
-    
-    # Renderização da barra do estimado com o IC associado
-    ax.bar([0], [res["mean"]], width=0.4, color=colors[i], alpha=0.85, edgecolor=colors[i], label="Estimado (NBM)")
-    err_lo = res["mean"] - res["ic_lo"]
-    err_hi = res["ic_hi"] - res["mean"]
-    ax.errorbar([0], [res["mean"]], yerr=[[err_lo], [err_hi]], fmt="none", color="#2C2C2A", capsize=10, capthick=2, elinewidth=2)
-    
-    # Linha Horizontal do Valor Teórico
-    ax.axhline(res["teorico"], color="#E65100", linewidth=2, linestyle="--", label=f"Teórico ({res['teorico']:.4f} s)")
-    
-    # Ajustes finos de layout por quadrante
-    ax.set_title(f"Cenário {res['id']} (ρ = {res['rho']:.2f})\nd* = {res['d']:,} | N = {res['n_final']:,}", fontsize=11, fontweight='bold')
-    ax.set_ylabel("Wq (segundos)", fontsize=10)
-    ax.set_xticks([])
-    ax.grid(axis="y", color="#D3D1C7", linewidth=0.6, zorder=0)
-    
-    # Caixa de texto flutuante com dados resumidos
-    txt_box = f"Estimado: {res['mean']:.4f} s\nIC: [{res['ic_lo']:.4f}, {res['ic_hi']:.4f}]"
-    ax.text(0, res["ic_hi"] + (res["ic_hi"]*0.05), txt_box, ha="center", va="bottom", fontsize=9, bbox=dict(facecolor='white', alpha=0.6, boxstyle='round,pad=0.3'))
-    
-    # Margem dinâmica para o topo do gráfico não cortar labels
-    ax.set_ylim(res["ic_lo"] * 0.7, res["ic_hi"] * 1.25)
-    ax.legend(loc="lower right", fontsize=9)
-
-plt.suptitle("Comparativo de Cenários M/M/1 utilizando MSER-5Y e Parada por NBM (B=20)", fontsize=14, fontweight='bold', y=0.98)
-plt.tight_layout()
-plt.savefig(PNG_SAIDA, dpi=150)
-plt.close()
-
-print(f"\nProcesso Finalizado. Gráfico salvo com sucesso em: {PNG_SAIDA}")
+print("\nConcluído!")
