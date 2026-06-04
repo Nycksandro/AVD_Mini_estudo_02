@@ -285,7 +285,7 @@ for rotulo, lista_res in mapeamento_resultados.items():
         ax.legend(loc="lower right", fontsize=9)
 
     nome_arquivo = os.path.join(DIR, f"grafico_obm_overlap_{rotulo.replace('%','')}.png")
-    plt.suptitle(f"Fila M/M/1 - OBM ({rotulo} Overlap) em Conformidade com Notas de Aula", fontsize=12, fontweight='bold', y=0.98)
+    plt.suptitle(f"Fila M/M/1 - OBM ({rotulo} Overlap)", fontsize=12, fontweight='bold', y=0.98)
     plt.tight_layout()
     plt.savefig(nome_arquivo, dpi=150)
     plt.close()
