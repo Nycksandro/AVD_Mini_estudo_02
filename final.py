@@ -359,6 +359,150 @@ class Experimento:
         relatorio.to_csv(caminho_relatorio, index=False, float_format="%.6f")
         print(f"  Relatório agregado salvo em: {caminho_relatorio}\n")
 
+    # ── Etapa 8: Cálculo dos efeitos fatoriais ────────────────────────────────
+
+    def calcular_efeitos_fatoriais(
+        self,
+        caminho_csv: str = "resultados_sobel.csv",
+        metricas: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Calcula q0 e todos os coeficientes do modelo fatorial 2³ usando a
+        tabela de sinais, para cada métrica solicitada.
+
+        Modelo:
+            y = q0 + qA·xA + qB·xB + qC·xC
+                   + qAB·xA·xB + qAC·xA·xC + qBC·xB·xC
+                   + qABC·xA·xB·xC + ε
+
+        Codificação dos níveis (−1 / +1):
+            A  — Threshold      : 40 → −1  |  80 → +1
+            B  — Border type    : BORDER_CONSTANT (zero_padding) → −1  |  BORDER_REPLICATE → +1
+            C  — Tamanho máscara: 3  → −1  |  7  → +1
+
+        Cada coeficiente q é calculado como:
+            q_termo = (1 / N) · Σ (sinal_termo_i · y_i)
+        onde N = número total de observações (8 combinações × r repetições × n_imgs).
+
+        Interpretação dos resultados impressos:
+            • Efeito alto  → o fator (ou interação) altera fortemente a métrica.
+            • Efeito baixo → o fator atua de forma mais independente / pouco influente.
+            • Erro experimental (σ²) → variabilidade residual entre repetições.
+        """
+        if metricas is None:
+            metricas = ["f1score", "precision", "recall", "tempo_ms", "cpu_time_ms"]
+
+        df = pd.read_csv(caminho_csv).dropna(subset=metricas)
+
+        # ── Codificar fatores em −1 / +1 ─────────────────────────────────────
+        mapa_threshold = {40: -1, 80: +1}
+        mapa_border    = {"zero_padding": -1, "replicate": +1}
+        mapa_ksize     = {3: -1, 7: +1}
+
+        df["xA"] = df["threshold"].map(mapa_threshold)
+        df["xB"] = df["border_type"].map(mapa_border)
+        df["xC"] = df["ksize"].map(mapa_ksize)
+
+        # Verificar se todos os valores foram mapeados corretamente
+        for col, nome in [("xA", "threshold"), ("xB", "border_type"), ("xC", "ksize")]:
+            if df[col].isna().any():
+                raise ValueError(
+                    f"Valores inesperados na coluna '{nome}'. "
+                    f"Valores únicos encontrados: {df[nome].unique()}"
+                )
+
+        # ── Colunas de interação ──────────────────────────────────────────────
+        df["xAB"]  = df["xA"] * df["xB"]
+        df["xAC"]  = df["xA"] * df["xC"]
+        df["xBC"]  = df["xB"] * df["xC"]
+        df["xABC"] = df["xA"] * df["xB"] * df["xC"]
+
+        termos = {
+            "q0"   : None,       # intercepto: média geral
+            "qA"   : "xA",
+            "qB"   : "xB",
+            "qC"   : "xC",
+            "qAB"  : "xAB",
+            "qAC"  : "xAC",
+            "qBC"  : "xBC",
+            "qABC" : "xABC",
+        }
+
+        N = len(df)
+
+        # ── Calcular coeficientes para cada métrica ───────────────────────────
+        linhas = []
+        for metrica in metricas:
+            y = df[metrica].values
+            linha = {"metrica": metrica, "N_obs": N}
+
+            for nome_termo, col_sinal in termos.items():
+                if col_sinal is None:          # q0 = média geral
+                    coef = y.mean()
+                else:
+                    sinais = df[col_sinal].values
+                    coef   = (sinais * y).mean()
+                linha[nome_termo] = coef
+
+            # ── Erro experimental: variância entre repetições por combinação ──
+            # Para cada combinação, calculamos a variância entre as r repetições
+            # e depois tiramos a média — isso é a estimativa do erro puro σ².
+            var_por_comb = (
+                df.groupby(["threshold", "border_type", "ksize"])[metrica]
+                .var(ddof=1)
+                .dropna()
+            )
+            sigma2 = var_por_comb.mean()       # média das variâncias (erro puro)
+            sigma  = np.sqrt(sigma2) if sigma2 >= 0 else np.nan
+
+            linha["erro_sigma2"] = sigma2
+            linha["erro_sigma"]  = sigma
+
+            linhas.append(linha)
+
+        df_efeitos = pd.DataFrame(linhas)
+
+        # ── Imprimir tabela no terminal ───────────────────────────────────────
+        colunas_ordem = [
+            "metrica", "N_obs",
+            "q0", "qA", "qB", "qC",
+            "qAB", "qAC", "qBC", "qABC",
+            "erro_sigma2", "erro_sigma",
+        ]
+        df_efeitos = df_efeitos[colunas_ordem]
+
+        pd.set_option("display.max_columns", None)
+        pd.set_option("display.width",       200)
+        pd.set_option("display.float_format", "{:.6f}".format)
+
+        legenda = (
+            "\nLegenda dos fatores:\n"
+            "  A — Threshold       : nível baixo=40  | nível alto=80\n"
+            "  B — Tratamento borda: nível baixo=zero_padding | nível alto=replicate\n"
+            "  C — Tamanho máscara : nível baixo=3   | nível alto=7\n"
+            "\nInterpretação:\n"
+            "  q0           → média geral das respostas\n"
+            "  qA, qB, qC   → efeito principal de cada fator\n"
+            "  qAB,qAC,qBC  → interação de 2ª ordem (efeito de um depende do outro)\n"
+            "  qABC         → interação de 3ª ordem\n"
+            "  erro_sigma2  → variância do erro experimental (entre repetições)\n"
+            "  erro_sigma   → desvio padrão do erro experimental\n"
+        )
+
+        print("\n" + "═" * 100)
+        print("  ETAPA 8 — COEFICIENTES DO MODELO FATORIAL 2³")
+        print("═" * 100)
+        print(legenda)
+        print(df_efeitos.to_string(index=False))
+        print("═" * 100 + "\n")
+
+        # ── Salvar CSV ────────────────────────────────────────────────────────
+        caminho_efeitos = caminho_csv.replace(".csv", "_efeitos.csv")
+        df_efeitos.to_csv(caminho_efeitos, index=False, float_format="%.8f")
+        print(f"  Coeficientes salvos em: {caminho_efeitos}\n")
+
+        return df_efeitos
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PONTO DE ENTRADA
@@ -370,4 +514,8 @@ if __name__ == "__main__":
     # Descomente a linha abaixo na primeira execução para reorganizar o dataset:
     # exp.preparar_dataset()
 
+    # Etapa 7 — execução do experimento (gera resultados_sobel.csv)
     exp.executar_experimento()
+
+    # Etapa 8 — cálculo dos efeitos fatoriais (lê resultados_sobel.csv)
+    exp.calcular_efeitos_fatoriais("resultados_sobel.csv")
