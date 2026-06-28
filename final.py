@@ -80,12 +80,12 @@ class Experimento:
             print(f"  {contador} imagens copiadas para {destino}/")
 
         origens_imgs = [
-            "BIPEDv2/BIPED/edges/imgs/train/rgbr/real",
-            "BIPEDv2/BIPED/edges/imgs/test/rgbr",
+            "BIPEDv2/BIPEDv2/BIPED/edges/imgs/train/rgbr/real",
+            "BIPEDv2/BIPEDv2/BIPED/edges/imgs/test/rgbr",
         ]
         origens_gabs = [
-            "BIPEDv2/BIPED/edges/edge_maps/train/rgbr/real",
-            "BIPEDv2/BIPED/edges/edge_maps/test/rgbr",
+            "BIPEDv2/BIPEDv2/BIPED/edges/edge_maps/train/rgbr/real",
+            "BIPEDv2/BIPEDv2/BIPED/edges/edge_maps/test/rgbr",
         ]
 
         for pasta in [PASTA_IMAGENS, PASTA_GABARITO, PASTA_DETECTADOS]:
@@ -367,27 +367,21 @@ class Experimento:
         metricas: list[str] | None = None,
     ) -> pd.DataFrame:
         """
-        Calcula q0 e todos os coeficientes do modelo fatorial 2³ usando a
-        tabela de sinais, para cada métrica solicitada.
+        Calcula q0 e todos os coeficientes do modelo fatorial 2³r usando a
+        tabela de sinais, seguindo o método da teoria de planejamento fatorial.
 
-        Modelo:
-            y = q0 + qA·xA + qB·xB + qC·xC
-                   + qAB·xA·xB + qAC·xA·xC + qBC·xB·xC
-                   + qABC·xA·xB·xC + ε
+        Procedimento correto para 2^k com replicação (r repetições):
+          1. Agregar: calcular a média de cada combinação sobre as r repetições
+             e todas as imagens (unidade experimental).
+          2. Aplicar a tabela de sinais sobre as 8 médias → coeficientes q.
+          3. Calcular SST = 2^k · r · n_imgs · Σ(q²)  (excluindo q0).
+          4. Calcular a fração de variação explicada por cada termo: SS_termo / SST.
+          5. Estimar o erro puro σ² como a média das variâncias intra-combinação.
 
         Codificação dos níveis (−1 / +1):
-            A  — Threshold      : 40 → −1  |  80 → +1
-            B  — Border type    : BORDER_CONSTANT (zero_padding) → −1  |  BORDER_REPLICATE → +1
-            C  — Tamanho máscara: 3  → −1  |  7  → +1
-
-        Cada coeficiente q é calculado como:
-            q_termo = (1 / N) · Σ (sinal_termo_i · y_i)
-        onde N = número total de observações (8 combinações × r repetições × n_imgs).
-
-        Interpretação dos resultados impressos:
-            • Efeito alto  → o fator (ou interação) altera fortemente a métrica.
-            • Efeito baixo → o fator atua de forma mais independente / pouco influente.
-            • Erro experimental (σ²) → variabilidade residual entre repetições.
+            A — Threshold      : 40 → −1  |  80 → +1
+            B — Border type    : zero_padding → −1  |  replicate → +1
+            C — Tamanho máscara: 3  → −1  |  7  → +1
         """
         if metricas is None:
             metricas = ["f1score", "precision", "recall", "tempo_ms", "cpu_time_ms"]
@@ -403,7 +397,6 @@ class Experimento:
         df["xB"] = df["border_type"].map(mapa_border)
         df["xC"] = df["ksize"].map(mapa_ksize)
 
-        # Verificar se todos os valores foram mapeados corretamente
         for col, nome in [("xA", "threshold"), ("xB", "border_type"), ("xC", "ksize")]:
             if df[col].isna().any():
                 raise ValueError(
@@ -417,44 +410,65 @@ class Experimento:
         df["xBC"]  = df["xB"] * df["xC"]
         df["xABC"] = df["xA"] * df["xB"] * df["xC"]
 
-        termos = {
-            "q0"   : None,       # intercepto: média geral
-            "qA"   : "xA",
-            "qB"   : "xB",
-            "qC"   : "xC",
-            "qAB"  : "xAB",
-            "qAC"  : "xAC",
-            "qBC"  : "xBC",
-            "qABC" : "xABC",
-        }
+        colunas_sinais = ["xA", "xB", "xC", "xAB", "xAC", "xBC", "xABC"]
 
-        N = len(df)
+        # ── Passo 1: média por combinação (agrega repetições e imagens) ───────
+        # Cada combinação = (threshold, border_type, ksize)
+        # A média é calculada sobre todas as repetições e imagens dessa combinação,
+        # pois cada imagem é uma unidade experimental dentro da combinação.
+        grupos = ["threshold", "border_type", "ksize", "xA", "xB", "xC",
+                  "xAB", "xAC", "xBC", "xABC"]
+        df_medias = df.groupby(grupos)[metricas].mean().reset_index()
 
-        # ── Calcular coeficientes para cada métrica ───────────────────────────
+        # Parâmetros do experimento
+        k       = 3                        # número de fatores
+        n_comb  = 2 ** k                   # 8 combinações
+        r       = df["repeticao"].nunique() # número de repetições
+        n_imgs  = df["nome_img"].nunique()  # número de imagens
+
         linhas = []
         for metrica in metricas:
-            y = df[metrica].values
-            linha = {"metrica": metrica, "N_obs": N}
+            y_med = df_medias[metrica].values   # 8 médias (uma por combinação)
 
-            for nome_termo, col_sinal in termos.items():
-                if col_sinal is None:          # q0 = média geral
-                    coef = y.mean()
-                else:
-                    sinais = df[col_sinal].values
-                    coef   = (sinais * y).mean()
-                linha[nome_termo] = coef
+            linha = {"metrica": metrica, "n_combinacoes": n_comb, "r": r, "n_imgs": n_imgs}
 
-            # ── Erro experimental: variância entre repetições por combinação ──
-            # Para cada combinação, calculamos a variância entre as r repetições
-            # e depois tiramos a média — isso é a estimativa do erro puro σ².
+            # ── Passo 2: coeficientes pela tabela de sinais ───────────────────
+            # q0 = média geral das 8 médias de combinação
+            q0 = y_med.mean()
+            linha["q0"] = q0
+
+            coefs = {}
+            for col in colunas_sinais:
+                sinais = df_medias[col].values
+                coef   = (sinais * y_med).mean()   # média ponderada pelos sinais
+                nome_q = "q" + col[1:]             # xA→qA, xAB→qAB, etc.
+                linha[nome_q] = coef
+                coefs[nome_q] = coef
+
+            # ── Passo 3: SS de cada termo e SST ──────────────────────────────
+            # SS_termo = 2^k · r · n_imgs · q²_termo
+            # SST = soma de todos os SS_termo (excluindo q0)
+            fator_ss = n_comb * r * n_imgs
+            ss = {nome_q: fator_ss * (q ** 2) for nome_q, q in coefs.items()}
+            sst = sum(ss.values())
+
+            linha["SST"] = sst
+            for nome_q, val in ss.items():
+                linha[f"SS_{nome_q[1:]}"] = val   # SS_A, SS_B, etc.
+
+            # ── Passo 4: fração de variação explicada ─────────────────────────
+            for nome_q, val in ss.items():
+                fracao = (val / sst * 100) if sst > 0 else 0.0
+                linha[f"pct_{nome_q[1:]}"] = fracao   # pct_A, pct_B, etc.
+
+            # ── Passo 5: erro experimental (variância pura entre repetições) ──
             var_por_comb = (
                 df.groupby(["threshold", "border_type", "ksize"])[metrica]
                 .var(ddof=1)
                 .dropna()
             )
-            sigma2 = var_por_comb.mean()       # média das variâncias (erro puro)
+            sigma2 = var_por_comb.mean()
             sigma  = np.sqrt(sigma2) if sigma2 >= 0 else np.nan
-
             linha["erro_sigma2"] = sigma2
             linha["erro_sigma"]  = sigma
 
@@ -462,17 +476,9 @@ class Experimento:
 
         df_efeitos = pd.DataFrame(linhas)
 
-        # ── Imprimir tabela no terminal ───────────────────────────────────────
-        colunas_ordem = [
-            "metrica", "N_obs",
-            "q0", "qA", "qB", "qC",
-            "qAB", "qAC", "qBC", "qABC",
-            "erro_sigma2", "erro_sigma",
-        ]
-        df_efeitos = df_efeitos[colunas_ordem]
-
+        # ── Imprimir resultado no terminal ────────────────────────────────────
         pd.set_option("display.max_columns", None)
-        pd.set_option("display.width",       200)
+        pd.set_option("display.width",       220)
         pd.set_option("display.float_format", "{:.6f}".format)
 
         legenda = (
@@ -480,26 +486,43 @@ class Experimento:
             "  A — Threshold       : nível baixo=40  | nível alto=80\n"
             "  B — Tratamento borda: nível baixo=zero_padding | nível alto=replicate\n"
             "  C — Tamanho máscara : nível baixo=3   | nível alto=7\n"
-            "\nInterpretação:\n"
-            "  q0           → média geral das respostas\n"
-            "  qA, qB, qC   → efeito principal de cada fator\n"
-            "  qAB,qAC,qBC  → interação de 2ª ordem (efeito de um depende do outro)\n"
-            "  qABC         → interação de 3ª ordem\n"
-            "  erro_sigma2  → variância do erro experimental (entre repetições)\n"
-            "  erro_sigma   → desvio padrão do erro experimental\n"
+            "\nCoeficientes (tabela de sinais sobre médias por combinação):\n"
+            "  q0              → média geral\n"
+            "  qA, qB, qC      → efeitos principais\n"
+            "  qAB, qAC, qBC   → interações de 2ª ordem\n"
+            "  qABC            → interação de 3ª ordem\n"
+            "\nVariação explicada:\n"
+            "  SS_X   → soma de quadrados do termo X  (SS_X = 2^k · r · n_imgs · qX²)\n"
+            "  SST    → soma total  (SST = Σ SS_X, excluindo q0)\n"
+            "  pct_X  → porcentagem da variação total explicada pelo termo X\n"
+            "\nErro:\n"
+            "  erro_sigma2 → variância pura estimada entre repetições\n"
+            "  erro_sigma  → desvio padrão do erro experimental\n"
         )
 
-        print("\n" + "═" * 100)
-        print("  ETAPA 8 — COEFICIENTES DO MODELO FATORIAL 2³")
-        print("═" * 100)
+        # Tabela de coeficientes
+        cols_coef = ["metrica", "q0", "qA", "qB", "qC", "qAB", "qAC", "qBC", "qABC"]
+        # Tabela de variação explicada
+        cols_pct  = ["metrica", "SST", "SS_A", "SS_B", "SS_C",
+                     "SS_AB", "SS_AC", "SS_BC", "SS_ABC",
+                     "pct_A", "pct_B", "pct_C",
+                     "pct_AB", "pct_AC", "pct_BC", "pct_ABC",
+                     "erro_sigma2", "erro_sigma"]
+
+        print("\n" + "═" * 110)
+        print("  ETAPA 8 — COEFICIENTES DO MODELO FATORIAL 2³r")
+        print("═" * 110)
         print(legenda)
-        print(df_efeitos.to_string(index=False))
-        print("═" * 100 + "\n")
+        print("── Coeficientes ──")
+        print(df_efeitos[cols_coef].to_string(index=False))
+        print("\n── Variação explicada (%) e erro experimental ──")
+        print(df_efeitos[cols_pct].to_string(index=False))
+        print("═" * 110 + "\n")
 
         # ── Salvar CSV ────────────────────────────────────────────────────────
         caminho_efeitos = caminho_csv.replace(".csv", "_efeitos.csv")
         df_efeitos.to_csv(caminho_efeitos, index=False, float_format="%.8f")
-        print(f"  Coeficientes salvos em: {caminho_efeitos}\n")
+        print(f"  Coeficientes e frações salvas em: {caminho_efeitos}\n")
 
         return df_efeitos
 
@@ -511,8 +534,10 @@ class Experimento:
 if __name__ == "__main__":
     exp = Experimento()
 
-    # Descomente a linha abaixo na primeira execução para reorganizar o dataset:
-    # exp.preparar_dataset()
+    # Prepara o dataset automaticamente se a pasta ainda não tiver imagens
+    if not any(PASTA_IMAGENS.glob("*.jpg")):
+        print("Pasta de imagens vazia — preparando dataset...\n")
+        exp.preparar_dataset()
 
     # Etapa 7 — execução do experimento (gera resultados_sobel.csv)
     exp.executar_experimento()
